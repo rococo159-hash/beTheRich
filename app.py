@@ -7,10 +7,27 @@ import plotly.graph_objects as go
 # 1. 웹페이지 제목 및 레이아웃 설정
 st.set_page_config(layout="wide")
 
-# 2. 사이드바 UI — 오직 일회성 API 통제만 전담 🔐
+# 2. [핵심 보완] 사이드바 UI — Secrets 비밀 금고 자동 연동 및 백업 이중화 🔐
 st.sidebar.title("🔐 시스템 보안 통제")
-with st.sidebar.expander("🔑 구글 Gemini API Key 입력", expanded=True):
-    api_key = st.text_input("API Key:", type="password")
+
+# 스트림릿 클라우드 Secrets 금고에서 GEMINI_API_KEY가 있는지 우선 탐색
+secret_key = st.secrets.get("GEMINI_API_KEY", "")
+
+if secret_key:
+    # 금고에서 키를 발견한 경우 자동 로그인 처리
+    api_key = secret_key
+    st.sidebar.success("🔒 Secrets 금고에서 API Key를 자동으로 불러왔습니다.")
+    
+    # 백업용으로 다른 키를 입력해 볼 수 있는 숨김 창 제공
+    with st.sidebar.expander("🔑 다른 API Key로 대체하기 (선택)", expanded=False):
+        user_override = st.text_input("대체 API Key 입력:", type="password")
+        if user_override:
+            api_key = user_override
+else:
+    # 금고에 키가 없는 경우 (Local PC 개발 환경 등) 수동 입력창 강제 활성화
+    with st.sidebar.expander("🔑 구글 Gemini API Key 입력 (수동)", expanded=True):
+        api_key = st.text_input("API Key:", type="password")
+    st.sidebar.caption("※ 클라우드 Secrets 설정 전이므로 수동 입력이 필요합니다.")
 
 # 3. 메인 관제 패널 🎛️
 st.title("🎛️ 글로벌 텐베거 종합 검증 및 가치평가 시스템")
@@ -78,12 +95,11 @@ if len(hist) > 0:
     stoch_d = hist['%D'].dropna().iloc[-1] if not hist['%D'].dropna().empty else 50
     volume_ratio = (hist['Volume'].iloc[-1] / hist['Volume'].mean()) * 100
 
-    # 💡 [핵심 추가] 애널리스트 컨센서스 데이터 가공 영역
+    # 애널리스트 컨센서스 데이터 가공
     target_mean = info.get('targetMeanPrice')
     recommendation_key = info.get('recommendationKey', 'N/A').upper()
     num_analysts = info.get('numberOfAnalystOpinions', 'N/A')
     
-    # 영문 추천 키워드 한글 직관성 변환
     recommendation_mapping = {
         'STRONG_BUY': '🔥 강력 매수 (Strong Buy)',
         'BUY': '🟢 매수 (Buy)',
@@ -160,7 +176,6 @@ if len(hist) > 0:
             roe = info.get('returnOnEquity', 0) * 100
             st.metric(label="현재 ROE", value=f"{roe:.2f}%" if roe != 0 else "N/A")
             
-        # 💡 [핵심 추가] 6. 대시보드 내 애널리스트 합산 컨센서스 스코어 표출
         st.write("---")
         st.subheader("🏛️ 기관 애널리스트 투자 합산 뷰")
         an_col1, an_col2, an_col3 = st.columns(3)
@@ -225,7 +240,7 @@ if len(hist) > 0:
     if manual_news:
         news_context += f"\n[투자자 직접 입력 이슈]\n{manual_news}\n"
 
-    # 7. 균형 잡힌 투자전략 리포트 발급 엔진 🤖
+    # 7. 균형 잡힌 투자전략 리포트 발급 엔진
     st.write("---")
     st.subheader("🧠 글로벌 자산운용사 전략가 종합 리서치 보고서 (개인 투자용)")
     
@@ -240,7 +255,6 @@ if len(hist) > 0:
                     model = None
                     response = None
                     
-                    # 💡 [프롬프트 리셋] 냉철함을 유지하되, 성장 모멘텀(긍정)과 위험 요인(부정)을 완벽히 저울질하도록 페르소나 수정
                     prompt = f"""
                     너는 글로벌 대형 자산운용사의 최고투자책임자(CIO)이자 균형 잡힌 시각으로 자본 효율성을 극대화하는 수석 투자전략가야.
                     개인의 전 재산이 걸린 무거운 투자 결정이므로, 근거 없는 맹목적 낙관론도 배제해야 하지만, 기업 고유의 파괴적 가치와 촉매제를 깎아내리는 과도한 비관론도 지양해야 한다.
@@ -262,7 +276,7 @@ if len(hist) > 0:
                     3. 🏛️ **기관 및 애널리스트 컨센서스 평가**:
                        - 현재 제시된 기관들의 평균 목표주가와 종합 매수 의견의 신뢰도를 평가하고, 시장 참여자들이 이 주식의 미래 가치를 대략 얼마로 산정하고 있는지 요약하십시오.
                     4. 📊 **투자 결정을 위한 최종 전략 제언**:
-                       - 120일선 이격도와 스토캐스틱 위치, 그리고 위 가치 평가를 총합하여 지금 진입하는 행위의 손익비를 평가하십시오. (예: 성장성이 뛰어나나 단기 과열이므로 눌림목 매수 권장, 혹은 현재 가격은 성장성 대비 현저한 저평가 구간이므로 적극적 분할 매수 유효 등) 구체적인 행동 가이드를 제시하십시오.
+                       - 120일선 이격도와 스토캐스틱 위치, 그리고 위 가치 평가를 총합하여 지금 진입하는 행위의 손익비를 평가하십시오. 구체적인 행동 가이드를 제시하십시오.
                     """
                     
                     for model_name in model_candidates:
