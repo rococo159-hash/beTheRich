@@ -89,10 +89,27 @@ if len(hist) > 0:
     hist['%K'] = 100 * ((hist['Close'] - low_14) / denom.replace(0, 1))
     hist['%D'] = hist['%K'].rolling(window=3, min_periods=1).mean()
     
+    # MACD 계산
+    exp1 = hist['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = hist['Close'].ewm(span=26, adjust=False).mean()
+    hist['MACD'] = exp1 - exp2
+    hist['Signal'] = hist['MACD'].ewm(span=9, adjust=False).mean()
+    hist['Histogram'] = hist['MACD'] - hist['Signal']
+    
+    # RSI 계산 (14일)
+    delta = hist['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
+    rs = gain / loss.replace(0, 1)
+    hist['RSI'] = 100 - (100 / (1 + rs))
+    
     ma20_val = hist['MA20'].dropna().iloc[-1] if not hist['MA20'].dropna().empty else current_price
     ma120_val = hist['MA120'].dropna().iloc[-1] if not hist['MA120'].dropna().empty else current_price
     stoch_k = hist['%K'].dropna().iloc[-1] if not hist['%K'].dropna().empty else 50
     stoch_d = hist['%D'].dropna().iloc[-1] if not hist['%D'].dropna().empty else 50
+    macd_val = hist['MACD'].dropna().iloc[-1] if not hist['MACD'].dropna().empty else 0.0
+    macd_signal = hist['Signal'].dropna().iloc[-1] if not hist['Signal'].dropna().empty else 0.0
+    rsi_val = hist['RSI'].dropna().iloc[-1] if not hist['RSI'].dropna().empty else 50.0
     volume_ratio = (hist['Volume'].iloc[-1] / hist['Volume'].mean()) * 100
 
     # 애널리스트 컨센서스 데이터 가공
@@ -134,12 +151,14 @@ if len(hist) > 0:
         st.plotly_chart(fig, use_container_width=True)
         
         st.write("📈 **기술적 수급 지표 데이터**")
-        t_col1, t_col2, t_col3 = st.columns(3)
+        t_col1, t_col2, t_col3, t_col4 = st.columns(4)
         with t_col1:
             st.metric(label="120일선 이격도", value=f"{((current_price/ma120_val)-1)*100:.1f}%" if ma120_val != 0 else "0.0%")
         with t_col2:
             st.metric(label="스토캐스틱 K/D", value=f"{stoch_k:.1f} / {stoch_d:.1f}")
         with t_col3:
+            st.metric(label="RSI (14일)", value=f"{rsi_val:.1f}")
+        with t_col4:
             st.metric(label="당일 거래량 (평균대비)", value=f"{volume_ratio:.1f}%")
 
     with right_col:
@@ -195,6 +214,15 @@ if len(hist) > 0:
             st.metric(label="참여 애널리스트 수", value=f"{num_analysts} 명")
             
         st.write("---")
+        st.subheader("📊 MACD 및 모멘텀 지표")
+        macd_col1, macd_col2 = st.columns(2)
+        
+        with macd_col1:
+            st.metric(label="MACD", value=f"{macd_val:.4f}")
+        with macd_col2:
+            st.metric(label="MACD Signal", value=f"{macd_signal:.4f}")
+            
+        st.write("---")
         st.subheader("🎯 개인 투자 원칙 기반 조건 검증")
         
         is_small_cap = market_cap < small_cap_threshold
@@ -202,6 +230,7 @@ if len(hist) > 0:
         is_reasonable_per = (isinstance(per, (int, float)) and per <= 30) or per_display == "N/A (적자 기업)"
         is_near_ma120 = (current_price / ma120_val) <= 1.10 if ma120_val != 0 else False
         is_stoch_low = stoch_k < 30
+        is_rsi_oversold = rsi_val < 30
 
         pass_count = sum([is_small_cap, is_high_roe, is_reasonable_per])
         
@@ -214,6 +243,7 @@ if len(hist) > 0:
             
         st.markdown(f"- **텐베거 재무 펀더멘털 통과 여부:** {'✅ 합격' if pass_count >= 2 else '❌ 기준 미달'}")
         st.markdown(f"- **가격 안전마진 (120일선 기준):** {'✅ 확보 (진입 유리)' if is_near_ma120 else '❌ 이격 과열 (눌림목 대기 요망)'}")
+        st.markdown(f"- **RSI 과매도 진입 여부:** {'✅ 과매도 진입 신호' if is_rsi_oversold else '❌ 정상 범위'}")
 
     # 6. 실시간 뉴스 및 정보 수집 컨텍스트
     st.write("---")
@@ -257,26 +287,26 @@ if len(hist) > 0:
                     
                     prompt = f"""
                     너는 글로벌 대형 자산운용사의 최고투자책임자(CIO)이자 균형 잡힌 시각으로 자본 효율성을 극대화하는 수석 투자전략가야.
-                    개인의 전 재산이 걸린 무거운 투자 결정이므로, 근거 없는 맹목적 낙관론도 배제해야 하지만, 기업 고유의 파괴적 가치와 촉매제를 깎아내리는 과도한 비관론도 지양해야 한다.
-                    
-                    반드시 구글 검색 기능(Google Search Tool)을 활용하여 이 기업 '{company_name}'의 핵심 사업 매력도와 월가/여의도의 긍정적 리포트 논리를 상호 검증하여 리포트를 작성해라.
+                    개인의 전 재산이 걸린 무거운 투자 결정이므로, 근거 없는 맹목적 낙관론도 배제해야 하지만, 기업 고유의 파괴적 가치와 촉매제를 깎아내려서도 안 된다.
+
+                    반드시 구글 검색 기능(Google Search Tool)을 활용하여 이 기업 '{company_name}'의 핵심 사업 매력도와 월가/여의도의 긍정적 리포트 논리를 상세히 조사하시오.
 
                     [대상 종목]: {company_name} ({ticker})
                     [정량 퀀트 데이터]: 현재가 {current_price:.2f} / 시총 {market_cap:.2f}{cap_unit} / PER {per_display} / ROE {roe:.2f}%
-                    [기술적 포지션]: 20일선 {ma20_val:.2f} / 120일선 {ma120_val:.2f} / 스토캐스틱 {stoch_k:.1f}
+                    [기술적 포지션]: 20일선 {ma20_val:.2f} / 120일선 {ma120_val:.2f} / 스토캐스틱 {stoch_k:.1f} / RSI {rsi_val:.1f} / MACD {macd_val:.4f}
                     [기관 수급 정보]: 의견 {recommendation_kor} / 목표가 {target_mean} / 참여 인원 {num_analysts}명
                     [투자자 제공 단서]:
                     {news_context}
 
                     [출력 필수 서식 - 무조건 존댓말을 쓰되, 감정을 배제하고 완벽하게 이성적이고 균형 잡힌 애널리스트 톤을 유지]:
                     1. 📈 **상승 촉매제 및 핵심 성장 모멘텀 분석 (Bull Case)**:
-                       - 구글 실시간 서치 및 컨센서스 분석을 기초로, 이 기업이 미래에 주가 폭발(텐베거)을 일으킬 수밖에 없다고 판단되는 핵심 기술력, 독점적 시장 지위, 대규모 수주 가능성 등 강력한 상승 시나리오의 핵심 근거를 분석하십시오.
+                       - 구글 실시간 서치 및 컨센서스 분석을 기초로, 이 기업이 미래에 주가 폭발(텐베거)을 일으킬 수밖에 없다고 판단되는 핵심 기술력, 독점 기술, 사업 확장성을 명시하시오.
                     2. 🚨 **실시간 다운사이드 리스크 및 방어 기전 (Bear Case)**:
-                       - 동전의 뒷면으로서, 이 기업의 상승 스토리를 정면으로 가로막을 수 있는 치명적인 대외 리스크, 경쟁사의 추격, 재무적 한계(적자 지속 또는 자금 조달 리스크)를 냉정하게 짚어내십시오.
+                       - 동전의 뒷면으로서, 이 기업의 상승 스토리를 정면으로 가로막을 수 있는 치명적인 대외 리스크, 경쟁사의 추격, 재무적 한계(적자 기업 여부 등)를 객관적으로 제시하시오.
                     3. 🏛️ **기관 및 애널리스트 컨센서스 평가**:
-                       - 현재 제시된 기관들의 평균 목표주가와 종합 매수 의견의 신뢰도를 평가하고, 시장 참여자들이 이 주식의 미래 가치를 대략 얼마로 산정하고 있는지 요약하십시오.
+                       - 현재 제시된 기관들의 평균 목표주가와 종합 매수 의견의 신뢰도를 평가하고, 시장 참여자들이 이 주식의 미래 가치를 대략 얼마로 평가 중인지 해석하시오.
                     4. 📊 **투자 결정을 위한 최종 전략 제언**:
-                       - 120일선 이격도와 스토캐스틱 위치, MACD, RSI 가치 평가를 총합하여 지금 진입하는 행위의 손익비를 평가하십시오. 구체적인 행동 가이드를 손절가와 익절가를 제시해주십시오.
+                       - 120일선 이격도와 스토캐스틱 위치, MACD, RSI 가치 평가를 총합하여 지금 진입하는 행위의 손익비를 평가하십시오. 구체적인 행동 가이드라인(매수/보유/관망/회피)을 제시하시오.
                     """
                     
                     for model_name in model_candidates:
