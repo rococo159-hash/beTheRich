@@ -1,4 +1,6 @@
+ta
 yfinance
-google-generativeai
-pandas
 plotly
+matplotlib
+pandas
+streamlit
