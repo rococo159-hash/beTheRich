@@ -1,6 +1,6 @@
-ta
-yfinance
-plotly
-matplotlib
-pandas
 streamlit
+yfinance
+pandas
+matplotlib
+plotly
+ta
