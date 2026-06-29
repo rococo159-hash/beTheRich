@@ -189,6 +189,18 @@ if len(hist) > 0:
     rs = gain / loss.replace(0, 1)
     hist['RSI'] = 100 - (100 / (1 + rs))
 
+    # ---- 골든/데드 크로스 탐지 ----
+    # 가격 크로스: MA20이 MA60을 상향 돌파(골든) / 하향 돌파(데드)
+    diff_price = hist['MA20'] - hist['MA60']
+    cross_up = (diff_price.shift(1) < 0) & (diff_price > 0)      # 골든크로스
+    cross_dn = (diff_price.shift(1) > 0) & (diff_price < 0)      # 데드크로스
+    hist['GoldenCross'] = cross_up
+    hist['DeadCross'] = cross_dn
+    # MACD 크로스: MACD가 Signal을 상향/하향 돌파
+    diff_macd = hist['MACD'] - hist['Signal']
+    hist['MacdGolden'] = (diff_macd.shift(1) < 0) & (diff_macd > 0)
+    hist['MacdDead'] = (diff_macd.shift(1) > 0) & (diff_macd < 0)
+
     def last_valid(col, fallback):
         s = hist[col].dropna()
         return s.iloc[-1] if not s.empty else fallback
@@ -266,18 +278,17 @@ if len(hist) > 0:
         view = hist.tail(n)
 
         fig = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.78, 0.22], vertical_spacing=0.03,
-            subplot_titles=("", "")
+            rows=4, cols=1, shared_xaxes=True,
+            row_heights=[0.50, 0.14, 0.18, 0.18], vertical_spacing=0.03,
         )
 
+        # ----- (1행) 캔들 + 이동평균선 -----
         fig.add_trace(go.Candlestick(
             x=view.index, open=view['Open'], high=view['High'],
             low=view['Low'], close=view['Close'], name="가격",
             increasing_line_color="#26a69a", increasing_fillcolor="#26a69a",
             decreasing_line_color="#ef5350", decreasing_fillcolor="#ef5350",
         ), row=1, col=1)
-
         fig.add_trace(go.Scatter(x=view.index, y=view['MA20'], name="MA20",
                                  line=dict(color="#f0b90b", width=1.3)), row=1, col=1)
         fig.add_trace(go.Scatter(x=view.index, y=view['MA60'], name="MA60",
@@ -285,30 +296,102 @@ if len(hist) > 0:
         fig.add_trace(go.Scatter(x=view.index, y=view['MA120'], name="MA120",
                                  line=dict(color="#e040fb", width=1.5)), row=1, col=1)
 
+        # 골든크로스/데드크로스 마커 (가격 차트 위)
+        gc = view[view['GoldenCross'] == True]
+        dc = view[view['DeadCross'] == True]
+        if not gc.empty:
+            fig.add_trace(go.Scatter(
+                x=gc.index, y=gc['MA20'], mode='markers', name='골든크로스',
+                marker=dict(symbol='triangle-up', size=13, color='#00e676',
+                            line=dict(width=1, color='white'))), row=1, col=1)
+        if not dc.empty:
+            fig.add_trace(go.Scatter(
+                x=dc.index, y=dc['MA20'], mode='markers', name='데드크로스',
+                marker=dict(symbol='triangle-down', size=13, color='#ff1744',
+                            line=dict(width=1, color='white'))), row=1, col=1)
+
+        # ----- (2행) 거래량 -----
         vol_colors = ["#26a69a" if c >= o else "#ef5350"
                       for c, o in zip(view['Close'], view['Open'])]
         fig.add_trace(go.Bar(x=view.index, y=view['Volume'], name="거래량",
                              marker_color=vol_colors, opacity=0.6), row=2, col=1)
 
+        # ----- (3행) RSI -----
+        fig.add_trace(go.Scatter(x=view.index, y=view['RSI'], name="RSI",
+                                 line=dict(color="#ab47bc", width=1.5)), row=3, col=1)
+        fig.add_hline(y=70, line=dict(color="#ef5350", width=1, dash="dash"), row=3, col=1)
+        fig.add_hline(y=30, line=dict(color="#26a69a", width=1, dash="dash"), row=3, col=1)
+
+        # ----- (4행) MACD -----
+        macd_hist_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in view['Histogram']]
+        fig.add_trace(go.Bar(x=view.index, y=view['Histogram'], name="MACD Hist",
+                             marker_color=macd_hist_colors, opacity=0.5), row=4, col=1)
+        fig.add_trace(go.Scatter(x=view.index, y=view['MACD'], name="MACD",
+                                 line=dict(color="#2962ff", width=1.3)), row=4, col=1)
+        fig.add_trace(go.Scatter(x=view.index, y=view['Signal'], name="Signal",
+                                 line=dict(color="#f0b90b", width=1.3)), row=4, col=1)
+
+        # MACD 골든/데드 마커
+        mg = view[view['MacdGolden'] == True]
+        md = view[view['MacdDead'] == True]
+        if not mg.empty:
+            fig.add_trace(go.Scatter(
+                x=mg.index, y=mg['MACD'], mode='markers', name='MACD 골든',
+                marker=dict(symbol='circle', size=9, color='#00e676',
+                            line=dict(width=1, color='white')),
+                showlegend=False), row=4, col=1)
+        if not md.empty:
+            fig.add_trace(go.Scatter(
+                x=md.index, y=md['MACD'], mode='markers', name='MACD 데드',
+                marker=dict(symbol='circle', size=9, color='#ff1744',
+                            line=dict(width=1, color='white')),
+                showlegend=False), row=4, col=1)
+
         fig.update_layout(
             template="plotly_dark",
             paper_bgcolor="#131722", plot_bgcolor="#131722",
-            height=620, margin=dict(l=10, r=10, t=30, b=10),
+            height=900, margin=dict(l=10, r=10, t=30, b=10),
             xaxis_rangeslider_visible=False,
             legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
             hovermode="x unified",
             font=dict(color="#d1d4dc"),
+            barmode="overlay",
         )
-        fig.update_yaxes(gridcolor="#2a2e39", row=1, col=1, side="right", title_text="가격")
-        fig.update_yaxes(gridcolor="#2a2e39", row=2, col=1, side="right", title_text="거래량")
-        fig.update_xaxes(gridcolor="#2a2e39", row=2, col=1, rangebreaks=[dict(bounds=["sat", "mon"])])
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], row=1, col=1)
+        for r in [1, 2, 3, 4]:
+            fig.update_yaxes(gridcolor="#2a2e39", row=r, col=1, side="right")
+            fig.update_xaxes(gridcolor="#2a2e39", row=r, col=1,
+                             rangebreaks=[dict(bounds=["sat", "mon"])])
+        fig.update_yaxes(title_text="가격", row=1, col=1)
+        fig.update_yaxes(title_text="거래량", row=2, col=1)
+        fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+        fig.update_yaxes(title_text="MACD", row=4, col=1)
 
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("💡 차트를 드래그하면 확대, 더블클릭하면 원위치됩니다. 캔들에 마우스를 올리면 OHLC가 표시됩니다.")
+        st.caption(
+            "💡 드래그하면 확대, 더블클릭하면 원위치. "
+            "▲초록 = 골든크로스(MA20이 MA60 상향돌파, 상승 신호), "
+            "▼빨강 = 데드크로스(하향돌파, 하락 신호). "
+            "RSI 점선은 과매수(70)·과매도(30) 기준선입니다."
+        )
 
     # ---------- 탭2: 기술지표 ----------
     with tab_tech:
+        # 최근 크로스 발생일 안내
+        recent_gc = hist[hist['GoldenCross'] == True].index
+        recent_dc = hist[hist['DeadCross'] == True].index
+        last_gc = recent_gc[-1].strftime("%Y-%m-%d") if len(recent_gc) else None
+        last_dc = recent_dc[-1].strftime("%Y-%m-%d") if len(recent_dc) else None
+
+        cross_msg = []
+        if last_gc:
+            cross_msg.append(f"🟢 최근 골든크로스: **{last_gc}**")
+        if last_dc:
+            cross_msg.append(f"🔴 최근 데드크로스: **{last_dc}**")
+        if cross_msg:
+            st.info("　|　".join(cross_msg))
+        else:
+            st.info("최근 1년 내 MA20/MA60 교차(크로스)가 없습니다.")
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("120일선 이격도", f"{((current_price/ma120_val)-1)*100:.1f}%" if ma120_val else "0.0%")
         c2.metric("스토캐스틱 K / D", f"{stoch_k:.1f} / {stoch_d:.1f}")
