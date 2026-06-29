@@ -189,8 +189,11 @@ if len(hist) > 0:
     recommendation_kor = recommendation_mapping.get(recommendation_key, recommendation_key)
 
     # ---- 가치지표 ----
-    market_cap = info.get('marketCap', 0) / cap_divider
-    per = info.get('trailingPE') or info.get('forwardPE')
+    mc = info.get('marketCap') or 0
+    market_cap = mc / cap_divider if mc and cap_divider else 0
+    per = info.get('trailingPE') or info.get('forwardPE') or 0
+    if per == 0 or pd.isna(per):
+    per = None
     if not isinstance(per, (int, float)) or pd.isna(per):
         eps = info.get('trailingEps') or info.get('forwardEps')
         if isinstance(eps, (int, float)) and eps > 0 and current_price > 0:
