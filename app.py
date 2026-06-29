@@ -120,7 +120,21 @@ if len(hist) == 0 and market_choice == "국내 주식 (KR)" and ticker.endswith(
     hist = load_history(ticker)
 
 if len(hist) > 0:
-    info = stock_data.info
+    # info 호출도 rate-limit 대비
+    try:
+        info = stock_data.info
+    except Exception:
+        info = {
+            'longName': ticker,
+            'regularMarketPrice': None,
+            'marketCap': None,
+            'trailingPE': None,
+            'returnOnEquity': None,
+            'targetMeanPrice': None,
+            'recommendationKey': 'N/A',
+            'numberOfAnalystOpinions': 'N/A'
+        }
+    
     company_name = info.get('longName', info.get('shortName', ticker))
 
     valid_close = hist['Close'].dropna()
