@@ -1,9 +1,22 @@
+import os
+import time
+import tempfile
 import streamlit as st
 import yfinance as yf
 import google.generativeai as genai
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# ============================================================
+# yfinance 캐시 경로 설정 (Streamlit Cloud rate-limit 완화)
+# ============================================================
+try:
+    _cache_dir = os.path.join(tempfile.gettempdir(), "py-yfinance")
+    os.makedirs(_cache_dir, exist_ok=True)
+    yf.set_tz_cache_location(_cache_dir)
+except Exception:
+    pass
 
 # ============================================================
 # 페이지 설정
@@ -104,37 +117,48 @@ else:
     currency_symbol, cap_unit, cap_divider, small_cap_threshold = "₩", "조 원", 1_000_000_000_000, 1.5
 
 # ============================================================
-# 데이터 로드
+# 데이터 로드 (rate-limit 대비 재시도 포함)
 # ============================================================
-@st.cache_data(ttl=300)
-def load_history(tk):
-    return yf.Ticker(tk).history(period="1y")
+@st.cache_data(ttl=600, show_spinner="📡 시세 데이터를 불러오는 중...")
+def load_history(tk, retries=3):
+    last_err = None
+    for attempt in range(retries):
+        try:
+            df = yf.Ticker(tk).history(period="1y")
+            if len(df) > 0:
+                return df, None
+        except Exception as e:
+            last_err = e
+        time.sleep(1.5 * (attempt + 1))
+    return pd.DataFrame(), last_err
 
 stock_data = yf.Ticker(ticker)
-hist = load_history(ticker)
+hist, load_err = load_history(ticker)
 
 # 코스피 실패 시 코스닥 재시도 (직접입력 6자리인 경우)
 if len(hist) == 0 and market_choice == "국내 주식 (KR)" and ticker.endswith(".KS"):
     ticker = ticker.replace(".KS", ".KQ")
     stock_data = yf.Ticker(ticker)
-    hist = load_history(ticker)
+    hist, load_err = load_history(ticker)
+
+# rate-limit 등으로 데이터를 못 받은 경우 안내 후 중단
+if len(hist) == 0 and load_err is not None and "RateLimit" in type(load_err).__name__:
+    st.error("⏳ 야후 파이낸스가 일시적으로 요청을 제한하고 있습니다 (Rate Limit).")
+    st.info(
+        "이 현상은 보통 **일시적**이며, 클라우드의 공유 IP 때문에 자주 발생합니다.\n\n"
+        "- **5~10분 정도 기다린 뒤** 새로고침(F5)해 보세요.\n"
+        "- 같은 종목을 연속으로 여러 번 조회하지 말고 잠시 간격을 두세요.\n"
+        "- 대부분 한 시간 안에 자동으로 풀립니다."
+    )
+    st.stop()
 
 if len(hist) > 0:
     # info 호출도 rate-limit 대비
     try:
         info = stock_data.info
     except Exception:
-        info = {
-            'longName': ticker,
-            'regularMarketPrice': None,
-            'marketCap': None,
-            'trailingPE': None,
-            'returnOnEquity': None,
-            'targetMeanPrice': None,
-            'recommendationKey': 'N/A',
-            'numberOfAnalystOpinions': 'N/A'
-        }
-    
+        info = {}
+
     company_name = info.get('longName', info.get('shortName', ticker))
 
     valid_close = hist['Close'].dropna()
@@ -180,7 +204,7 @@ if len(hist) > 0:
 
     # ---- 애널리스트 ----
     target_mean = info.get('targetMeanPrice')
-    recommendation_key = info.get('recommendationKey', 'N/A').upper()
+    recommendation_key = (info.get('recommendationKey') or 'N/A').upper()
     num_analysts = info.get('numberOfAnalystOpinions', 'N/A')
     recommendation_mapping = {
         'STRONG_BUY': '🔥 강력 매수', 'BUY': '🟢 매수', 'HOLD': '🟡 보유',
@@ -191,15 +215,18 @@ if len(hist) > 0:
     # ---- 가치지표 ----
     mc = info.get('marketCap') or 0
     market_cap = mc / cap_divider if mc and cap_divider else 0
-    per = info.get('trailingPE') or info.get('forwardPE') or 0
-    if per == 0 or pd.isna(per):
-    per = None
+
+    per = info.get('trailingPE') or info.get('forwardPE')
     if not isinstance(per, (int, float)) or pd.isna(per):
         eps = info.get('trailingEps') or info.get('forwardEps')
         if isinstance(eps, (int, float)) and eps > 0 and current_price > 0:
             per = current_price / eps
+        else:
+            per = None
     per_display = f"{per:.2f}" if isinstance(per, (int, float)) and per > 0 else "N/A (적자)"
-    roe = info.get('returnOnEquity', 0) * 100
+
+    roe_raw = info.get('returnOnEquity')
+    roe = roe_raw * 100 if isinstance(roe_raw, (int, float)) else 0
 
     # ========================================================
     # 헤더: 현재 분석 대상 + 핵심 요약 메트릭
@@ -215,7 +242,7 @@ if len(hist) > 0:
 
     h1, h2, h3, h4 = st.columns(4)
     h1.metric("현재 주가", price_str)
-    h2.metric("시가총액", f"{currency_symbol}{market_cap:,.2f}{cap_unit}")
+    h2.metric("시가총액", f"{currency_symbol}{market_cap:,.2f}{cap_unit}" if market_cap else "N/A")
     h3.metric("PER", per_display)
     h4.metric("ROE", f"{roe:.2f}%" if roe != 0 else "N/A")
 
@@ -244,7 +271,6 @@ if len(hist) > 0:
             subplot_titles=("", "")
         )
 
-        # 캔들
         fig.add_trace(go.Candlestick(
             x=view.index, open=view['Open'], high=view['High'],
             low=view['Low'], close=view['Close'], name="가격",
@@ -252,7 +278,6 @@ if len(hist) > 0:
             decreasing_line_color="#ef5350", decreasing_fillcolor="#ef5350",
         ), row=1, col=1)
 
-        # 이동평균선
         fig.add_trace(go.Scatter(x=view.index, y=view['MA20'], name="MA20",
                                  line=dict(color="#f0b90b", width=1.3)), row=1, col=1)
         fig.add_trace(go.Scatter(x=view.index, y=view['MA60'], name="MA60",
@@ -260,7 +285,6 @@ if len(hist) > 0:
         fig.add_trace(go.Scatter(x=view.index, y=view['MA120'], name="MA120",
                                  line=dict(color="#e040fb", width=1.5)), row=1, col=1)
 
-        # 거래량 (상승/하락 색 구분)
         vol_colors = ["#26a69a" if c >= o else "#ef5350"
                       for c, o in zip(view['Close'], view['Open'])]
         fig.add_trace(go.Bar(x=view.index, y=view['Volume'], name="거래량",
@@ -314,7 +338,7 @@ if len(hist) > 0:
 
     # ---------- 탭4: 조건검증 ----------
     with tab_check:
-        is_small_cap = market_cap < small_cap_threshold
+        is_small_cap = market_cap < small_cap_threshold if market_cap else False
         is_high_roe = roe >= 15.0
         is_reasonable_per = (isinstance(per, (int, float)) and per <= 30) or per_display.startswith("N/A")
         is_near_ma120 = (current_price / ma120_val) <= 1.10 if ma120_val else False
