@@ -149,55 +149,99 @@ WORLD_RSS_FEEDS = [
 ]
 
 
-@st.cache_data(ttl=86400, show_spinner=False)  # 하루(86400초) 캐시
-def fetch_world_news_rss(day_key, max_items=6):
-    """세계 경제 뉴스를 RSS에서 가져옴. day_key는 날짜별 캐시 분리용."""
+@st.cache_data(ttl=43200, show_spinner=False)  # 12시간 캐시
+def fetch_world_news_rss(day_key, allowed_dates, max_items=8):
+    """세계 경제 뉴스를 RSS에서 가져옴.
+    allowed_dates: 표시를 허용할 날짜(datetime.date) 집합. 발행일이 이 안에 드는 기사만 반환.
+    day_key는 날짜별 캐시 분리용."""
     if not _HAS_FEEDPARSER:
         return None, "feedparser 미설치"
+
+    allowed = set(allowed_dates)
     for source_name, url in WORLD_RSS_FEEDS:
         try:
             d = feedparser.parse(url)
             entries = getattr(d, "entries", []) or []
-            if entries:
-                items = []
-                for e in entries[:max_items]:
-                    items.append({
-                        "title": e.get("title", "제목 없음"),
-                        "link": e.get("link", ""),
-                        "published": e.get("published", ""),
-                    })
-                return {"source": source_name, "items": items}, None
+            if not entries:
+                continue
+
+            filtered = []
+            for e in entries:
+                # 발행일 파싱 (parsed struct_time 우선, 없으면 스킵)
+                pub_struct = e.get("published_parsed") or e.get("updated_parsed")
+                pub_date = None
+                pub_str = e.get("published", e.get("updated", ""))
+                if pub_struct:
+                    try:
+                        pub_date = datetime.date(pub_struct.tm_year, pub_struct.tm_mon, pub_struct.tm_mday)
+                    except Exception:
+                        pub_date = None
+                # 날짜를 못 읽었거나, 허용 범위 밖이면 제외
+                if pub_date is None or pub_date not in allowed:
+                    continue
+                filtered.append({
+                    "title": e.get("title", "제목 없음"),
+                    "link": e.get("link", ""),
+                    "published": pub_str,
+                    "date": pub_date.isoformat(),
+                })
+
+            if filtered:
+                # 최신순 정렬
+                filtered.sort(key=lambda x: x["date"], reverse=True)
+                return {"source": source_name, "items": filtered[:max_items]}, None
+            # 이 피드는 범위 내 기사가 없음 → 다음 피드 시도
         except Exception:
             continue
-    return None, "모든 RSS 피드에서 뉴스를 가져오지 못했습니다."
+    return None, "선택한 날짜 범위(어제·오늘)에 해당하는 세계 경제 기사를 찾지 못했습니다."
 
 
-@st.cache_data(ttl=86400, show_spinner=False)  # 하루 캐시
-def fetch_korea_news_gemini(day_key, api_key):
-    """국내 경제 뉴스를 Gemini + 구글검색으로 요약."""
+@st.cache_data(ttl=43200, show_spinner=False)  # 12시간 캐시
+def fetch_korea_news_gemini(day_key, date_label, today_str, yesterday_str, api_key):
+    """국내 경제 뉴스를 Gemini + 구글검색으로 요약. 날짜를 명시해 환각을 억제."""
     if not api_key:
         return None, "API Key 없음"
     try:
         genai.configure(api_key=api_key)
+
+        if date_label == "오늘":
+            date_clause = (
+                f"오직 오늘({today_str}) 하루 동안 보도된 뉴스만 다뤄. "
+                f"{today_str} 이전 날짜의 뉴스는 절대 포함하지 마."
+            )
+        else:  # 어제
+            date_clause = (
+                f"오직 어제({yesterday_str}) 하루 동안 보도된 뉴스만 다뤄. "
+                f"{yesterday_str}이 아닌 다른 날짜의 뉴스는 절대 포함하지 마."
+            )
+
         prompt = (
-            "오늘 기준 대한민국 경제 관련 주요 뉴스 5개를 구글 검색으로 확인해서 정리해줘.\n"
-            "각 뉴스는 다음 형식으로:\n"
-            "- **[한 줄 제목]**: 무슨 일인지 1~2문장으로 쉽게 설명 (전문용어는 괄호로 풀어서)\n"
-            "증시·금리·환율·부동산·주요 기업 이슈 위주로 골라줘. "
-            "인사말이나 서론 없이 바로 목록부터 시작해. 편안한 존댓말로."
+            "너는 대한민국 경제 뉴스를 정리하는 역할이야. 반드시 구글 검색을 사용해 실제 보도된 기사만 확인해서 정리해.\n\n"
+            f"[날짜 제약 — 매우 중요]\n{date_clause}\n"
+            "날짜가 확실하지 않은 뉴스는 아예 넣지 마. 억지로 개수를 채우지 말고, "
+            "해당 날짜의 확실한 뉴스가 3개뿐이면 3개만 써. 없으면 없다고 솔직히 말해.\n"
+            "기억이나 추측으로 뉴스를 지어내는 것은 절대 금지야. 검색으로 확인된 것만.\n\n"
+            "[출력 형식]\n"
+            "- **(MM/DD) [한 줄 제목]**: 무슨 일인지 1~2문장으로 쉽게 설명 (전문용어는 괄호로 풀어서)\n"
+            "각 항목 맨 앞에 반드시 보도 날짜(MM/DD)를 붙여.\n"
+            "증시·금리·환율·부동산·주요 기업 이슈 위주로 골라줘.\n"
+            "인사말이나 서론 없이 바로 목록부터 시작해. 편안한 존댓말로.\n"
+            "만약 해당 날짜의 확실한 경제 뉴스를 찾지 못했으면 "
+            "'해당 날짜의 확인된 경제 뉴스를 찾지 못했어요. 다른 날짜를 선택하거나 새로고침해보세요.'라고만 답해."
         )
         for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
             try:
                 try:
                     model = genai.GenerativeModel(model_name, tools=[{"google_search": {}}])
+                    resp = model.generate_content(prompt)
+                    if resp and resp.text:
+                        return resp.text, None
                 except Exception:
-                    model = genai.GenerativeModel(model_name)
-                resp = model.generate_content(prompt)
-                if resp and resp.text:
-                    return resp.text, None
+                    # grounding 실패 시엔 검색 없는 답변은 환각 위험이 크므로 사용하지 않음
+                    continue
             except Exception:
                 continue
-        return None, "Gemini 호출 실패"
+        return None, "구글 검색 기반 요약에 실패했습니다 (검색 없이 생성된 답변은 환각 위험이 커서 표시하지 않아요)."
     except Exception as e:
         return None, str(e)
 
@@ -859,60 +903,87 @@ if len(hist) > 0:
 
     # ---------- 탭6: 오늘의 경제 (세계=RSS / 국내=Gemini) ----------
     with tab_news:
-        today_key = datetime.date.today().isoformat()
-        st.caption(f"🗓️ {today_key} 기준 · 하루 한 번 자동 업데이트돼요. (새로 보려면 아래 새로고침 버튼)")
+        today = datetime.date.today()
+        yesterday = today - datetime.timedelta(days=1)
+        today_str = today.isoformat()
+        yesterday_str = yesterday.isoformat()
 
-        if st.button("🔄 뉴스 새로고침 (오늘 다시 불러오기)"):
-            fetch_world_news_rss.clear()
-            fetch_korea_news_gemini.clear()
-            st.rerun()
+        nc1, nc2 = st.columns([2, 1])
+        with nc1:
+            date_label = st.radio(
+                "📅 뉴스 기간", ["오늘", "어제"], index=0, horizontal=True
+            )
+        with nc2:
+            st.write("")
+            if st.button("🔄 뉴스 새로고침", use_container_width=True):
+                fetch_world_news_rss.clear()
+                fetch_korea_news_gemini.clear()
+                st.rerun()
+
+        # 선택 날짜에 따른 허용 날짜 집합 / 표시 문자열
+        if date_label == "오늘":
+            allowed_dates = (today,)
+            shown_date = today_str
+        else:
+            allowed_dates = (yesterday,)
+            shown_date = yesterday_str
+
+        # 캐시 키: 날짜 + 라벨 조합 (오늘/어제 각각 따로 캐시)
+        cache_key = f"{today_str}_{date_label}"
+        st.caption(f"🗓️ **{shown_date}** ({date_label}) 뉴스만 표시해요 · 그 외 날짜 기사는 걸러냈어요.")
 
         news_col1, news_col2 = st.columns(2)
 
-        # ----- 세계 경제 (RSS) -----
+        # ----- 세계 경제 (RSS, 날짜 필터) -----
         with news_col1:
             st.subheader("🌍 세계 경제")
             with st.spinner("세계 경제 뉴스를 불러오는 중..."):
-                world_data, world_err = fetch_world_news_rss(today_key)
+                world_data, world_err = fetch_world_news_rss(cache_key, allowed_dates)
             if world_data and world_data.get("items"):
                 st.caption(f"출처: {world_data['source']}")
                 for it in world_data["items"]:
                     title = it["title"]
                     link = it["link"]
+                    date_tag = it.get("date", "")
+                    prefix = f"`{date_tag[5:]}` " if date_tag else ""  # MM-DD만
                     if link:
-                        st.markdown(f"- [{title}]({link})")
+                        st.markdown(f"- {prefix}[{title}]({link})")
                     else:
-                        st.markdown(f"- {title}")
+                        st.markdown(f"- {prefix}{title}")
             else:
                 st.info(
-                    "세계 경제 뉴스를 지금 불러오지 못했어요.\n\n"
-                    "RSS 제공처가 일시적으로 응답하지 않거나 접근이 제한됐을 수 있어요. "
-                    "잠시 후 새로고침해보세요."
+                    f"**{shown_date}**에 해당하는 세계 경제 기사를 찾지 못했어요.\n\n"
+                    "그날 발행된 기사가 아직 적거나, RSS 제공처가 일시적으로 응답하지 않을 수 있어요. "
+                    "'어제'로 바꿔보거나 잠시 후 새로고침해보세요."
                 )
                 if world_err:
                     st.caption(f"참고: {world_err}")
 
-        # ----- 국내 경제 (Gemini) -----
+        # ----- 국내 경제 (Gemini, 날짜 명시) -----
         with news_col2:
             st.subheader("🇰🇷 국내 경제")
             if not api_key:
                 st.warning("국내 경제 뉴스 요약에는 Gemini API Key가 필요해요. 왼쪽 설정에서 입력해주세요.")
             else:
                 with st.spinner("국내 경제 뉴스를 요약하는 중..."):
-                    kr_text, kr_err = fetch_korea_news_gemini(today_key, api_key)
+                    kr_text, kr_err = fetch_korea_news_gemini(
+                        cache_key, date_label, today_str, yesterday_str, api_key
+                    )
                 if kr_text:
                     st.markdown(kr_text)
                 else:
                     st.info(
-                        "국내 경제 뉴스를 지금 불러오지 못했어요. 잠시 후 새로고침해보세요."
+                        f"**{shown_date}**의 국내 경제 뉴스를 지금 불러오지 못했어요. "
+                        "'어제'로 바꿔보거나 잠시 후 새로고침해보세요."
                     )
                     if kr_err:
                         st.caption(f"참고: {kr_err}")
 
         st.write("---")
         st.caption(
-            "ℹ️ 세계 경제는 해외 매체 RSS 헤드라인, 국내 경제는 AI가 구글 검색으로 요약한 내용이에요. "
-            "투자 판단의 참고용이며, 원문 확인을 권해요."
+            "ℹ️ 세계 경제는 해외 매체 RSS 헤드라인(발행일 기준 필터링), "
+            "국내 경제는 AI가 구글 검색으로 확인한 요약이에요. "
+            "AI 요약은 부정확할 수 있으니 각 뉴스의 날짜와 원문을 꼭 확인하세요."
         )
 else:
     st.error("종목 코드가 유효하지 않거나 데이터를 불러올 수 없습니다. 종목명을 다시 선택하거나 코드를 확인해주세요.")
