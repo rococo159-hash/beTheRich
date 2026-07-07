@@ -545,6 +545,14 @@ if len(hist) > 0:
 
         # ---- 게이지 3종 (RSI / 스토캐스틱 / 거래량) ----
         def make_gauge(value, title, vmin, vmax, good_low, good_high, suffix=""):
+            # NaN/None 방어 + 범위 보정
+            try:
+                value = float(value)
+                if pd.isna(value):
+                    value = vmin
+            except (TypeError, ValueError):
+                value = vmin
+            value = max(vmin, min(value, vmax))
             g = go.Figure(go.Indicator(
                 mode="gauge+number",
                 value=value,
@@ -556,9 +564,9 @@ if len(hist) > 0:
                     "bgcolor": "#131722",
                     "borderwidth": 0,
                     "steps": [
-                        {"range": [vmin, good_low], "color": "#26a69a55"},
-                        {"range": [good_low, good_high], "color": "#5c636e33"},
-                        {"range": [good_high, vmax], "color": "#ef535055"},
+                        {"range": [vmin, good_low], "color": "rgba(38,166,154,0.33)"},
+                        {"range": [good_low, good_high], "color": "rgba(92,99,110,0.20)"},
+                        {"range": [good_high, vmax], "color": "rgba(239,83,80,0.33)"},
                     ],
                 },
             ))
