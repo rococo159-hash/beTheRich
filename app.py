@@ -25,7 +25,6 @@ st.set_page_config(page_title="관심종목분석", page_icon="📊", layout="wi
 
 # ============================================================
 # 국내/미국 종목명 → 티커 매핑
-#  - 국내: 야후 파이낸스용 .KS(코스피)/.KQ(코스닥) 접미사 포함
 # ============================================================
 KR_NAME_TO_TICKER = {
     "삼성전자": "005930.KS", "SK하이닉스": "000660.KS", "LG에너지솔루션": "373220.KS",
@@ -65,6 +64,68 @@ US_NAME_TO_TICKER = {
 }
 
 # ============================================================
+# 티커 검색 헬퍼 (야후 심볼 검색 메인 + Gemini 보조)
+# ============================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def yahoo_symbol_search(query, region_hint):
+    """야후 파이낸스 심볼 검색. 후보 리스트(dict) 반환."""
+    results = []
+    try:
+        from yfinance import Search
+        res = Search(query, max_results=10)
+        quotes = getattr(res, "quotes", []) or []
+        for q in quotes:
+            sym = q.get("symbol", "")
+            name = q.get("shortname") or q.get("longname") or ""
+            exch = q.get("exchange", "")
+            qtype = q.get("quoteType", "")
+            if not sym or qtype not in ("EQUITY", "ETF"):
+                continue
+            if region_hint == "KR" and not (sym.endswith(".KS") or sym.endswith(".KQ")):
+                continue
+            if region_hint == "US" and ("." in sym):
+                continue
+            results.append({"symbol": sym, "name": name, "exchange": exch})
+    except Exception:
+        pass
+    return results
+
+
+def gemini_ticker_lookup(query, region_hint, api_key):
+    """야후가 못 찾을 때 Gemini에게 티커를 물어보는 fallback."""
+    if not api_key:
+        return None
+    try:
+        genai.configure(api_key=api_key)
+        suffix_hint = (
+            "한국 주식이면 코스피는 .KS, 코스닥은 .KQ 접미사를 붙여줘."
+            if region_hint == "KR" else
+            "미국 주식이면 접미사 없이 티커만."
+        )
+        prompt = (
+            f"'{query}'라는 회사의 야후 파이낸스(Yahoo Finance) 티커 심볼만 알려줘. "
+            f"{suffix_hint} 설명 없이 티커 심볼 하나만 정확히 출력해. "
+            f"확실하지 않으면 'UNKNOWN'이라고만 답해."
+        )
+        for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+            try:
+                try:
+                    model = genai.GenerativeModel(model_name, tools=[{"google_search": {}}])
+                except Exception:
+                    model = genai.GenerativeModel(model_name)
+                resp = model.generate_content(prompt)
+                text = (resp.text or "").strip().upper().replace("`", "")
+                text = text.split()[0] if text else ""
+                if text and text != "UNKNOWN" and len(text) <= 12:
+                    return text
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================
 # 사이드바 — Gemini API Key
 # ============================================================
 st.sidebar.title("🔐 시스템 보안 통제")
@@ -89,10 +150,67 @@ st.write("시장 컨센서스, 기술적 수급, 실시간 성장 촉매를 융�
 st.write("---")
 
 # ============================================================
-# 입력부 — 종목명 검색 / 코드 직접입력 병행
+# 입력부 — 시장 선택
 # ============================================================
 market_choice = st.radio("📊 분석 대상 시장 선택", ["미국 주식 (US)", "국내 주식 (KR)"], horizontal=True)
+region_hint = "US" if market_choice == "미국 주식 (US)" else "KR"
 
+# ---- 세션 상태 초기화 ----
+if "resolved_ticker" not in st.session_state:
+    st.session_state.resolved_ticker = None
+
+# ============================================================
+# 🔎 기업 이름으로 티커 찾기 (야후 검색 + Gemini 보조)
+# ============================================================
+with st.expander("🔎 기업 이름으로 티커 찾기 (이름만 알아도 OK)", expanded=False):
+    st.caption("회사 이름을 입력하면 야후에서 티커 후보를 찾아드려요. 안 나오면 AI가 한 번 더 찾아봐요.")
+    sc1, sc2 = st.columns([3, 1])
+    with sc1:
+        search_query = st.text_input(
+            "회사 이름 입력",
+            placeholder="예: 삼성전자 / Samsung / Apple / 애플",
+            key="ticker_search_query",
+        )
+    with sc2:
+        st.write("")
+        st.write("")
+        do_search = st.button("🔍 티커 검색", use_container_width=True)
+
+    if do_search and search_query.strip():
+        with st.spinner("티커를 찾는 중..."):
+            candidates = yahoo_symbol_search(search_query.strip(), region_hint)
+
+        if candidates:
+            st.success(f"✅ {len(candidates)}개 후보를 찾았어요. 아래에서 골라주세요.")
+            for i, c in enumerate(candidates):
+                bcol1, bcol2 = st.columns([4, 1])
+                with bcol1:
+                    st.markdown(f"**{c['symbol']}** — {c['name']}  `{c['exchange']}`")
+                with bcol2:
+                    if st.button("이걸로", key=f"pick_{i}"):
+                        st.session_state.resolved_ticker = c["symbol"]
+                        st.rerun()
+        else:
+            # 야후 실패 → Gemini fallback
+            with st.spinner("야후에서 못 찾아서 AI에게 물어보는 중..."):
+                g_ticker = gemini_ticker_lookup(search_query.strip(), region_hint, api_key)
+            if g_ticker:
+                st.info(f"🤖 AI가 찾은 티커: **{g_ticker}**  (정확한지 아래 회사명으로 꼭 확인하세요)")
+                if st.button(f"'{g_ticker}' 로 분석하기"):
+                    st.session_state.resolved_ticker = g_ticker
+                    st.rerun()
+            else:
+                st.warning("티커를 찾지 못했어요. 철자를 바꿔보거나 아래에서 직접 입력해주세요.")
+
+    if st.session_state.resolved_ticker:
+        st.markdown(f"👉 현재 선택된 티커: **`{st.session_state.resolved_ticker}`**")
+        if st.button("❌ 선택 해제"):
+            st.session_state.resolved_ticker = None
+            st.rerun()
+
+# ============================================================
+# 입력부 — 종목명 드롭다운 / 코드 직접입력
+# ============================================================
 in_col1, in_col2 = st.columns(2)
 
 if market_choice == "미국 주식 (US)":
@@ -101,7 +219,7 @@ if market_choice == "미국 주식 (US)":
         chosen_name = st.selectbox("🔍 회사 이름으로 검색 (자동완성)", ["(직접 입력)"] + list(name_map.keys()))
     with in_col2:
         typed = st.text_input("⌨️ 또는 티커 직접 입력", "NVDA" if chosen_name == "(직접 입력)" else "")
-    ticker = (name_map.get(chosen_name) if chosen_name != "(직접 입력)" else typed.upper().strip()) or "NVDA"
+    default_ticker = (name_map.get(chosen_name) if chosen_name != "(직접 입력)" else typed.upper().strip()) or "NVDA"
     currency_symbol, cap_unit, cap_divider, small_cap_threshold = "$", "B", 1_000_000_000, 10.0
 else:
     name_map = KR_NAME_TO_TICKER
@@ -110,12 +228,18 @@ else:
     with in_col2:
         typed = st.text_input("⌨️ 또는 종목코드 6자리 직접 입력", "" if chosen_name != "(직접 입력)" else "005930")
     if chosen_name != "(직접 입력)":
-        ticker = name_map[chosen_name]
+        default_ticker = name_map[chosen_name]
     else:
-        # 숫자만 추출 + 6자리로 zero-padding (예: "5930" -> "005930")
         raw_digits = "".join(ch for ch in typed.strip() if ch.isdigit())
-        ticker = f"{raw_digits.zfill(6)}.KS" if raw_digits else "005930.KS"
+        default_ticker = f"{raw_digits.zfill(6)}.KS" if raw_digits else "005930.KS"
     currency_symbol, cap_unit, cap_divider, small_cap_threshold = "₩", "조 원", 1_000_000_000_000, 1.5
+
+# 티커 검색으로 고른 값이 있으면 그것을 우선 사용
+if st.session_state.resolved_ticker:
+    ticker = st.session_state.resolved_ticker
+    st.info(f"🔎 티커 검색으로 선택한 **{ticker}** 를 분석합니다. (위 '선택 해제'로 취소 가능)")
+else:
+    ticker = default_ticker
 
 # ============================================================
 # 데이터 로드 (rate-limit 대비 재시도 포함)
@@ -136,13 +260,12 @@ def load_history(tk, retries=3):
 stock_data = yf.Ticker(ticker)
 hist, load_err = load_history(ticker)
 
-# 코스피 실패 시 코스닥 재시도 (직접입력 6자리인 경우)
-if len(hist) == 0 and market_choice == "국내 주식 (KR)" and ticker.endswith(".KS"):
+# 코스피 실패 시 코스닥 재시도
+if len(hist) == 0 and region_hint == "KR" and ticker.endswith(".KS"):
     ticker = ticker.replace(".KS", ".KQ")
     stock_data = yf.Ticker(ticker)
     hist, load_err = load_history(ticker)
 
-# rate-limit 등으로 데이터를 못 받은 경우 안내 후 중단
 if len(hist) == 0 and load_err is not None and "RateLimit" in type(load_err).__name__:
     st.error("⏳ 야후 파이낸스가 일시적으로 요청을 제한하고 있습니다 (Rate Limit).")
     st.info(
@@ -154,7 +277,6 @@ if len(hist) == 0 and load_err is not None and "RateLimit" in type(load_err).__n
     st.stop()
 
 if len(hist) > 0:
-    # info 호출도 rate-limit 대비
     try:
         info = stock_data.info
     except Exception:
@@ -162,22 +284,20 @@ if len(hist) > 0:
 
     company_name = info.get('longName', info.get('shortName', ticker))
 
-    # ---- 종목코드 ↔ 실제 데이터 매칭 검증 (엉뚱한 회사 정보 방지) ----
-    # 국내 주식은 야후가 반환한 정보의 symbol이 요청한 티커와 다르거나,
-    # longName/shortName이 아예 비어있으면 잘못된 데이터일 가능성이 높음
+    # ---- 종목코드 ↔ 실제 데이터 매칭 검증 ----
     mismatch_warning = None
-    if market_choice == "국내 주식 (KR)":
+    if region_hint == "KR":
         returned_symbol = (info.get('symbol') or "").upper()
         expected_code = ticker.split(".")[0]
         if returned_symbol and expected_code not in returned_symbol:
             mismatch_warning = (
-                f"⚠️ 요청한 종목코드({ticker})와 야후 파이낸스가 반환한 정보(symbol: {returned_symbol})가 "
+                f"⚠️ 요청한 종목코드({ticker})와 야후가 반환한 정보(symbol: {returned_symbol})가 "
                 f"일치하지 않습니다. 아래 회사명이 원하시는 종목이 맞는지 꼭 확인해주세요."
             )
         elif not info.get('longName') and not info.get('shortName'):
             mismatch_warning = (
-                f"⚠️ {ticker}에 대한 회사명 정보를 야후 파이낸스에서 가져오지 못했습니다. "
-                f"종목코드를 다시 확인해주시거나, 잠시 후 다시 시도해주세요."
+                f"⚠️ {ticker}에 대한 회사명 정보를 가져오지 못했습니다. "
+                f"종목코드를 다시 확인하거나 잠시 후 다시 시도해주세요."
             )
 
     valid_close = hist['Close'].dropna()
@@ -208,12 +328,9 @@ if len(hist) > 0:
     rs = gain / loss.replace(0, 1)
     hist['RSI'] = 100 - (100 / (1 + rs))
 
-    # ---- 골든/데드 크로스 탐지 ----
     diff_price = hist['MA20'] - hist['MA60']
-    cross_up = (diff_price.shift(1) < 0) & (diff_price > 0)
-    cross_dn = (diff_price.shift(1) > 0) & (diff_price < 0)
-    hist['GoldenCross'] = cross_up
-    hist['DeadCross'] = cross_dn
+    hist['GoldenCross'] = (diff_price.shift(1) < 0) & (diff_price > 0)
+    hist['DeadCross'] = (diff_price.shift(1) > 0) & (diff_price < 0)
     diff_macd = hist['MACD'] - hist['Signal']
     hist['MacdGolden'] = (diff_macd.shift(1) < 0) & (diff_macd > 0)
     hist['MacdDead'] = (diff_macd.shift(1) > 0) & (diff_macd < 0)
@@ -231,8 +348,9 @@ if len(hist) > 0:
     rsi_val = last_valid('RSI', 50.0)
     volume_ratio = (hist['Volume'].iloc[-1] / hist['Volume'].mean()) * 100 if hist['Volume'].mean() else 0
 
-    # ---- 애널리스트 ----
     target_mean = info.get('targetMeanPrice')
+    target_high = info.get('targetHighPrice')
+    target_low = info.get('targetLowPrice')
     recommendation_key = (info.get('recommendationKey') or 'N/A').upper()
     num_analysts = info.get('numberOfAnalystOpinions', 'N/A')
     recommendation_mapping = {
@@ -241,7 +359,6 @@ if len(hist) > 0:
     }
     recommendation_kor = recommendation_mapping.get(recommendation_key, recommendation_key)
 
-    # ---- 가치지표 ----
     mc = info.get('marketCap') or 0
     market_cap = mc / cap_divider if mc and cap_divider else 0
 
@@ -258,21 +375,59 @@ if len(hist) > 0:
     roe = roe_raw * 100 if isinstance(roe_raw, (int, float)) else 0
 
     # ========================================================
-    # 헤더: 현재 분석 대상 + 핵심 요약 메트릭
+    # 헤더 + 종합 상태 배지
     # ========================================================
     st.markdown(f"### 🏢 현재 분석 중: **{company_name}**  `({ticker})`")
 
     if mismatch_warning:
         st.warning(mismatch_warning)
-        rc1, rc2 = st.columns([1, 4])
-        with rc1:
-            if st.button("🔄 데이터 다시 불러오기 (캐시 지우기)"):
-                st.cache_data.clear()
-                st.rerun()
+        if st.button("🔄 데이터 다시 불러오기 (캐시 지우기)"):
+            st.cache_data.clear()
+            st.rerun()
+
+    # ---- 종합 상태 판정 (배지용) ----
+    signal_score = 0
+    if isinstance(target_mean, (int, float)) and target_mean > 0 and current_price > 0:
+        if target_mean > current_price * 1.10:
+            signal_score += 1
+        elif target_mean < current_price * 0.95:
+            signal_score -= 1
+    if recommendation_key in ("STRONG_BUY", "BUY"):
+        signal_score += 1
+    elif recommendation_key in ("SELL", "UNDERPERFORM"):
+        signal_score -= 1
+    if rsi_val < 30:
+        signal_score += 1
+    elif rsi_val > 70:
+        signal_score -= 1
+    if macd_val > macd_signal:
+        signal_score += 1
+    else:
+        signal_score -= 1
+
+    if signal_score >= 2:
+        badge_bg, badge_txt, badge_label = "#0b3d2e", "#00e676", "🟢 긍정 신호 우위"
+    elif signal_score <= -2:
+        badge_bg, badge_txt, badge_label = "#3d0b12", "#ff5252", "🔴 주의 신호 우위"
+    else:
+        badge_bg, badge_txt, badge_label = "#3d360b", "#ffd54f", "🟡 중립 / 혼조"
+
+    st.markdown(
+        f"""
+        <div style="background:{badge_bg};padding:14px 18px;border-radius:12px;
+        border:1px solid {badge_txt}33;margin:6px 0 14px 0;">
+          <span style="font-size:20px;font-weight:700;color:{badge_txt};">
+          현재 종합 신호: {badge_label}</span>
+          <span style="color:#aaa;font-size:13px;margin-left:10px;">
+          (목표가·기관의견·RSI·MACD를 기계적으로 합산한 참고용 신호예요)</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if current_price == 0.0:
         price_str = "N/A"
-    elif market_choice == "국내 주식 (KR)":
+    elif region_hint == "KR":
         price_str = f"{currency_symbol}{int(current_price):,}"
     else:
         price_str = f"{currency_symbol}{current_price:,.2f}"
@@ -285,27 +440,19 @@ if len(hist) > 0:
 
     st.write("")
 
-    # ========================================================
-    # 탭 구조로 가독성 개선
-    # ========================================================
     tab_chart, tab_tech, tab_analyst, tab_check, tab_ai = st.tabs(
         ["📈 차트", "📊 기술지표", "🏛️ 애널리스트", "🎯 조건검증", "🧠 AI 리포트"]
     )
 
-    # ---------- 탭1: 트레이딩뷰 스타일 차트 ----------
+    # ---------- 탭1: 차트 ----------
     with tab_chart:
-        period_label = st.radio(
-            "표시 기간", ["1개월", "3개월", "6개월", "1년"],
-            index=2, horizontal=True
-        )
+        period_label = st.radio("표시 기간", ["1개월", "3개월", "6개월", "1년"], index=2, horizontal=True)
         period_map = {"1개월": 21, "3개월": 63, "6개월": 126, "1년": 252}
         n = period_map[period_label]
         view = hist.tail(n)
 
-        fig = make_subplots(
-            rows=4, cols=1, shared_xaxes=True,
-            row_heights=[0.50, 0.14, 0.18, 0.18], vertical_spacing=0.03,
-        )
+        fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
+                            row_heights=[0.50, 0.14, 0.18, 0.18], vertical_spacing=0.03)
 
         fig.add_trace(go.Candlestick(
             x=view.index, open=view['Open'], high=view['High'],
@@ -323,18 +470,15 @@ if len(hist) > 0:
         gc = view[view['GoldenCross'] == True]
         dc = view[view['DeadCross'] == True]
         if not gc.empty:
-            fig.add_trace(go.Scatter(
-                x=gc.index, y=gc['MA20'], mode='markers', name='골든크로스',
+            fig.add_trace(go.Scatter(x=gc.index, y=gc['MA20'], mode='markers', name='골든크로스',
                 marker=dict(symbol='triangle-up', size=13, color='#00e676',
                             line=dict(width=1, color='white'))), row=1, col=1)
         if not dc.empty:
-            fig.add_trace(go.Scatter(
-                x=dc.index, y=dc['MA20'], mode='markers', name='데드크로스',
+            fig.add_trace(go.Scatter(x=dc.index, y=dc['MA20'], mode='markers', name='데드크로스',
                 marker=dict(symbol='triangle-down', size=13, color='#ff1744',
                             line=dict(width=1, color='white'))), row=1, col=1)
 
-        vol_colors = ["#26a69a" if c >= o else "#ef5350"
-                      for c, o in zip(view['Close'], view['Open'])]
+        vol_colors = ["#26a69a" if c >= o else "#ef5350" for c, o in zip(view['Close'], view['Open'])]
         fig.add_trace(go.Bar(x=view.index, y=view['Volume'], name="거래량",
                              marker_color=vol_colors, opacity=0.6), row=2, col=1)
 
@@ -354,27 +498,20 @@ if len(hist) > 0:
         mg = view[view['MacdGolden'] == True]
         md = view[view['MacdDead'] == True]
         if not mg.empty:
-            fig.add_trace(go.Scatter(
-                x=mg.index, y=mg['MACD'], mode='markers', name='MACD 골든',
+            fig.add_trace(go.Scatter(x=mg.index, y=mg['MACD'], mode='markers', name='MACD 골든',
                 marker=dict(symbol='circle', size=9, color='#00e676',
-                            line=dict(width=1, color='white')),
-                showlegend=False), row=4, col=1)
+                            line=dict(width=1, color='white')), showlegend=False), row=4, col=1)
         if not md.empty:
-            fig.add_trace(go.Scatter(
-                x=md.index, y=md['MACD'], mode='markers', name='MACD 데드',
+            fig.add_trace(go.Scatter(x=md.index, y=md['MACD'], mode='markers', name='MACD 데드',
                 marker=dict(symbol='circle', size=9, color='#ff1744',
-                            line=dict(width=1, color='white')),
-                showlegend=False), row=4, col=1)
+                            line=dict(width=1, color='white')), showlegend=False), row=4, col=1)
 
         fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="#131722", plot_bgcolor="#131722",
+            template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
             height=900, margin=dict(l=10, r=10, t=30, b=10),
             xaxis_rangeslider_visible=False,
             legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0),
-            hovermode="x unified",
-            font=dict(color="#d1d4dc"),
-            barmode="overlay",
+            hovermode="x unified", font=dict(color="#d1d4dc"), barmode="overlay",
         )
         for r in [1, 2, 3, 4]:
             fig.update_yaxes(gridcolor="#2a2e39", row=r, col=1, side="right")
@@ -393,51 +530,114 @@ if len(hist) > 0:
             "RSI 점선은 과매수(70)·과매도(30) 기준선입니다."
         )
 
-    # ---------- 탭2: 기술지표 ----------
+    # ---------- 탭2: 기술지표 (게이지 추가) ----------
     with tab_tech:
         recent_gc = hist[hist['GoldenCross'] == True].index
         recent_dc = hist[hist['DeadCross'] == True].index
         last_gc = recent_gc[-1].strftime("%Y-%m-%d") if len(recent_gc) else None
         last_dc = recent_dc[-1].strftime("%Y-%m-%d") if len(recent_dc) else None
-
         cross_msg = []
         if last_gc:
             cross_msg.append(f"🟢 최근 골든크로스: **{last_gc}**")
         if last_dc:
             cross_msg.append(f"🔴 최근 데드크로스: **{last_dc}**")
-        if cross_msg:
-            st.info("　|　".join(cross_msg))
-        else:
-            st.info("최근 1년 내 MA20/MA60 교차(크로스)가 없습니다.")
+        st.info("　|　".join(cross_msg) if cross_msg else "최근 1년 내 MA20/MA60 교차(크로스)가 없습니다.")
 
+        # ---- 게이지 3종 (RSI / 스토캐스틱 / 거래량) ----
+        def make_gauge(value, title, vmin, vmax, good_low, good_high, suffix=""):
+            g = go.Figure(go.Indicator(
+                mode="gauge+number",
+                value=value,
+                number={"suffix": suffix, "font": {"size": 26, "color": "#d1d4dc"}},
+                title={"text": title, "font": {"size": 15, "color": "#d1d4dc"}},
+                gauge={
+                    "axis": {"range": [vmin, vmax], "tickcolor": "#888"},
+                    "bar": {"color": "#2962ff"},
+                    "bgcolor": "#131722",
+                    "borderwidth": 0,
+                    "steps": [
+                        {"range": [vmin, good_low], "color": "#26a69a55"},
+                        {"range": [good_low, good_high], "color": "#5c636e33"},
+                        {"range": [good_high, vmax], "color": "#ef535055"},
+                    ],
+                },
+            ))
+            g.update_layout(paper_bgcolor="#131722", height=230,
+                            margin=dict(l=20, r=20, t=50, b=10),
+                            font=dict(color="#d1d4dc"))
+            return g
+
+        gcol1, gcol2, gcol3 = st.columns(3)
+        with gcol1:
+            st.plotly_chart(make_gauge(rsi_val, "RSI (14일)", 0, 100, 30, 70),
+                            use_container_width=True)
+            st.caption("초록=과매도(살 만함) · 빨강=과매수(비쌈)")
+        with gcol2:
+            st.plotly_chart(make_gauge(stoch_k, "스토캐스틱 %K", 0, 100, 20, 80),
+                            use_container_width=True)
+            st.caption("초록=바닥권 · 빨강=천장권")
+        with gcol3:
+            vr_capped = min(volume_ratio, 300)
+            st.plotly_chart(make_gauge(vr_capped, "거래량 (평균대비)", 0, 300, 80, 150, suffix="%"),
+                            use_container_width=True)
+            st.caption("100% = 평소 수준 · 높으면 관심 급증")
+
+        st.write("---")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("120일선 이격도", f"{((current_price/ma120_val)-1)*100:.1f}%" if ma120_val else "0.0%")
         c2.metric("스토캐스틱 K / D", f"{stoch_k:.1f} / {stoch_d:.1f}")
         c3.metric("RSI (14일)", f"{rsi_val:.1f}")
         c4.metric("거래량 (평균대비)", f"{volume_ratio:.1f}%")
-
-        st.write("---")
         m1, m2, m3 = st.columns(3)
         m1.metric("MACD", f"{macd_val:.4f}")
         m2.metric("MACD Signal", f"{macd_signal:.4f}")
         m3.metric("MACD Histogram", f"{(macd_val-macd_signal):.4f}")
-
         st.caption("RSI 70↑ 과매수 / 30↓ 과매도 · 스토캐스틱 80↑ 과매수 / 20↓ 과매도 · MACD가 Signal 위면 상승 모멘텀")
 
-    # ---------- 탭3: 애널리스트 ----------
+    # ---------- 탭3: 애널리스트 (목표주가 바) ----------
     with tab_analyst:
         a1, a2, a3 = st.columns(3)
         a1.metric("기관 종합 의견", recommendation_kor)
         if isinstance(target_mean, (int, float)) and target_mean > 0 and current_price > 0:
             upside = ((target_mean / current_price) - 1) * 100
-            tgt = f"{currency_symbol}{int(target_mean):,}" if market_choice == "국내 주식 (KR)" else f"{currency_symbol}{target_mean:,.2f}"
+            tgt = f"{currency_symbol}{int(target_mean):,}" if region_hint == "KR" else f"{currency_symbol}{target_mean:,.2f}"
             a2.metric("평균 목표주가", tgt, delta=f"상승 여력 {upside:.1f}%")
         else:
             a2.metric("평균 목표주가", "N/A")
         a3.metric("참여 애널리스트", f"{num_analysts} 명")
+
+        # ---- 목표주가 범위 바 차트 ----
+        if isinstance(target_mean, (int, float)) and target_mean > 0 and current_price > 0:
+            lo = target_low if isinstance(target_low, (int, float)) and target_low > 0 else min(current_price, target_mean) * 0.9
+            hi = target_high if isinstance(target_high, (int, float)) and target_high > 0 else max(current_price, target_mean) * 1.1
+            fig_t = go.Figure()
+            fig_t.add_trace(go.Scatter(
+                x=[lo, hi], y=["목표가 범위", "목표가 범위"],
+                mode="lines", line=dict(color="#5c636e", width=14),
+                showlegend=False, hoverinfo="skip"))
+            fig_t.add_trace(go.Scatter(
+                x=[current_price], y=["목표가 범위"], mode="markers+text",
+                marker=dict(color="#f0b90b", size=18, symbol="diamond",
+                            line=dict(color="white", width=1)),
+                text=["현재가"], textposition="top center",
+                textfont=dict(color="#f0b90b"), showlegend=False))
+            fig_t.add_trace(go.Scatter(
+                x=[target_mean], y=["목표가 범위"], mode="markers+text",
+                marker=dict(color="#00e676", size=18, symbol="star",
+                            line=dict(color="white", width=1)),
+                text=["평균 목표가"], textposition="bottom center",
+                textfont=dict(color="#00e676"), showlegend=False))
+            fig_t.update_layout(
+                template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
+                height=200, margin=dict(l=10, r=10, t=30, b=10),
+                font=dict(color="#d1d4dc"),
+                xaxis=dict(title="주가", gridcolor="#2a2e39"),
+                yaxis=dict(showticklabels=False))
+            st.plotly_chart(fig_t, use_container_width=True)
+            st.caption("◆노랑 = 현재가 · ⭐초록 = 기관 평균 목표가 · 회색 막대 = 최저~최고 목표가 범위")
         st.caption("야후 파이낸스가 집계한 기관 컨센서스입니다. 종목에 따라 데이터가 없을 수 있습니다.")
 
-    # ---------- 탭4: 조건검증 ----------
+    # ---------- 탭4: 조건검증 (카드형) ----------
     with tab_check:
         is_small_cap = market_cap < small_cap_threshold if market_cap else False
         is_high_roe = roe >= 15.0
@@ -453,9 +653,29 @@ if len(hist) > 0:
         else:
             st.warning("⚠️ 기계적 진단: 고평가 혹은 성장 임계치 도달. 보수적 관점 유지.")
 
-        st.markdown(f"- **재무 펀더멘털:** {'✅ 합격' if pass_count >= 2 else '❌ 기준 미달'}")
-        st.markdown(f"- **가격 안전마진 (120일선):** {'✅ 확보' if is_near_ma120 else '❌ 이격 과열'}")
-        st.markdown(f"- **RSI 과매도 진입:** {'✅ 과매도 신호' if is_rsi_oversold else '❌ 정상 범위'}")
+        def check_card(label, ok, ok_txt, no_txt):
+            color = "#0b3d2e" if ok else "#3d0b12"
+            edge = "#00e676" if ok else "#ff5252"
+            mark = "✅" if ok else "❌"
+            txt = ok_txt if ok else no_txt
+            return f"""<div style="background:{color};border:1px solid {edge}44;
+            border-radius:10px;padding:12px 14px;margin:6px 0;">
+            <span style="font-size:16px;font-weight:600;color:{edge};">{mark} {label}</span><br>
+            <span style="color:#c8c8c8;font-size:13px;">{txt}</span></div>"""
+
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            st.markdown(check_card("재무 펀더멘털", pass_count >= 2,
+                        "ROE·PER 등 재무 기준을 충족했어요.",
+                        "재무 기준을 일부 못 채웠어요."), unsafe_allow_html=True)
+        with cc2:
+            st.markdown(check_card("가격 안전마진 (120일선)", is_near_ma120,
+                        "장기 평균선 근처라 과열이 덜해요.",
+                        "장기 평균선보다 많이 올라 있어요."), unsafe_allow_html=True)
+        with cc3:
+            st.markdown(check_card("RSI 과매도 진입", is_rsi_oversold,
+                        "과매도 구간이라 반등 여지가 있어요.",
+                        "과매도까지는 아니에요 (정상 범위)."), unsafe_allow_html=True)
         st.caption("개인 투자 원칙을 기계적으로 점검한 결과입니다. 매수/매도 권유가 아닙니다.")
 
     # ---------- 탭5: AI 리포트 ----------
@@ -494,16 +714,17 @@ if len(hist) > 0:
                         used_search = False
 
                         prompt = f"""
-너는 투자업계에서 20년 넘게 일한 삼촌이야. 지금 조카한테 카톡으로 "이 회사 어때?"라는 질문을 받아서
+너는 주식 투자를 오래 해온 친한 친구야. 지금 친구가 "이 회사 어때?"라고 물어봐서,
 편하게, 하지만 아는 건 정확하게 짚어주면서 설명해주는 상황이야.
 
 [말투 규칙 — 반드시 지킬 것]
 - 인사말, 자기소개, "~분석해 드리겠습니다" 같은 서론 문장은 절대 쓰지 말고 바로 0번 항목부터 시작해.
-- 애널리스트 격식체 대신, 삼촌이 조카에게 설명하듯 편안한 존댓말("~예요", "~거든요", "~해요")을 써.
-- 전문용어(PER, ROE, RSI, MACD 등)가 나오면 괄호로 짧게 풀어줘. 예: "PER(주가가 이익 대비 몇 배인지 보는 지표)"
-- 어려운 개념은 일상적인 비유를 들어 설명해. (예: 회사를 가게에 비유, 경쟁을 시험 등수에 비유 등)
-- 전체적으로 지금 흔히 나올 법한 애널리스트 리포트보다 분량을 2/3 수준으로 줄여서, 핵심만 간결하게 써.
-- 감정을 배제하고 균형 잡힌 시각은 유지하되(막연한 낙관·비관 금지), 문체만 편안하게.
+- 격식체 대신, 친한 친구에게 설명하듯 편안한 존댓말("~예요", "~거든요", "~더라고요", "~해요")을 써.
+- 전문용어(PER, ROE, RSI, MACD 등)가 나오면 괄호로 짧게 풀어줘. 예: "PER(주가가 회사 이익의 몇 배에 거래되는지 보는 지표)"
+- 어려운 개념은 일상적인 비유를 들어 설명해. (예: 회사를 동네 가게에 비유, 경쟁을 시험 등수에 비유 등)
+- 각 항목은 핵심만 던지고 끝내지 말고, 왜 그런지 배경까지 2~3문장 이상 충분히 풀어서 설명해. 너무 짧게 줄이지 마.
+- 다만 불필요하게 늘어지지는 말고, 읽는 사람이 "아 그렇구나" 하고 이해되게.
+- 감정을 배제하고 균형 잡힌 시각은 유지해(막연한 낙관·비관 금지). 문체만 편안하게.
 - 특정 매수·매도 시점을 단정적으로 지시하지 마.
 
 반드시 구글 검색을 활용해 '{company_name}'의 최신 사업 현황과 시장 평가를 확인하고 반영해.
@@ -516,12 +737,12 @@ if len(hist) > 0:
 {news_context}
 
 [출력 순서 — 위 말투 규칙을 지켜서]:
-0. 🏢 **이 회사, 한마디로 뭐하는 곳이야?**: 무슨 사업을 하는 회사인지 쉽게 2~3문장으로 설명하고, 이어서 지금 어떻게 돈을 벌고 있는지(또는 아직 적자라면 앞으로 어떻게 벌 계획인지)를 설명해.
-1. 📈 **오를 만한 이유 (Bull Case)**: 핵심 성장 동력과 강세 논리
-2. 🚨 **내릴 만한 이유 (Bear Case)**: 리스크와 약점
-3. 🏛️ **전문가들 생각 (기관 컨센서스)**: 목표가·의견이 얼마나 믿을만한지
-4. 📊 **지금 차트는 어떤 상태야?**: 이격도·스토캐스틱·MACD·RSI를 종합해서 지금이 과열/침체/중립 중 어디인지, 시나리오별로 균형 있게
-5. ✅ **한 줄 정리**: 위 내용을 3~4줄로 최종 요약. 조카가 결론만 읽어도 감이 잡히게.
+0. 🏢 **이 회사, 한마디로 뭐하는 곳이야?**: 무슨 사업을 하는 회사인지 쉽게 3~4문장으로 설명하고, 이어서 지금 어떻게 돈을 벌고 있는지(주력 사업·주요 고객 등), 아직 적자라면 앞으로 어떻게 벌 계획인지 구체적으로 설명해.
+1. 📈 **오를 만한 이유 (Bull Case)**: 핵심 성장 동력과 강세 논리를 배경까지 풀어서.
+2. 🚨 **내릴 만한 이유 (Bear Case)**: 리스크와 약점을 왜 위험한지까지.
+3. 🏛️ **전문가들 생각 (기관 컨센서스)**: 목표가·의견이 얼마나 믿을만한지, 왜 그렇게 보는지.
+4. 📊 **지금 차트는 어떤 상태야?**: 이격도·스토캐스틱·MACD·RSI를 종합해서 지금이 과열/침체/중립 중 어디인지, 시나리오별로 균형 있게.
+5. ✅ **한 줄 정리**: 위 내용을 3~4줄로 최종 요약. 친구가 결론만 읽어도 감이 잡히게.
 """
                         for model_name in model_candidates:
                             try:
