@@ -1,12 +1,19 @@
 import os
 import time
 import tempfile
+import datetime
 import streamlit as st
 import yfinance as yf
 import google.generativeai as genai
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+try:
+    import feedparser
+    _HAS_FEEDPARSER = True
+except Exception:
+    _HAS_FEEDPARSER = False
 
 # ============================================================
 # yfinance 캐시 경로 설정 (Streamlit Cloud rate-limit 완화)
@@ -123,6 +130,76 @@ def gemini_ticker_lookup(query, region_hint, api_key):
     except Exception:
         pass
     return None
+
+
+# ============================================================
+# 📰 오늘의 경제 뉴스 헬퍼
+#  - 세계 경제: RSS (여러 피드 순차 시도 fallback)
+#  - 국내 경제: Gemini + 구글검색 요약
+#  - 하루 1회 캐시 (같은 날 재호출 안 함)
+# ============================================================
+
+# 안정적인 해외 경제 매체 RSS 후보 (앞에서부터 시도, 되는 것 사용)
+WORLD_RSS_FEEDS = [
+    ("CNBC 경제", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
+    ("CNBC 주요뉴스", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"),
+    ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+    ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+    ("Investing.com", "https://www.investing.com/rss/news_25.rss"),
+]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)  # 하루(86400초) 캐시
+def fetch_world_news_rss(day_key, max_items=6):
+    """세계 경제 뉴스를 RSS에서 가져옴. day_key는 날짜별 캐시 분리용."""
+    if not _HAS_FEEDPARSER:
+        return None, "feedparser 미설치"
+    for source_name, url in WORLD_RSS_FEEDS:
+        try:
+            d = feedparser.parse(url)
+            entries = getattr(d, "entries", []) or []
+            if entries:
+                items = []
+                for e in entries[:max_items]:
+                    items.append({
+                        "title": e.get("title", "제목 없음"),
+                        "link": e.get("link", ""),
+                        "published": e.get("published", ""),
+                    })
+                return {"source": source_name, "items": items}, None
+        except Exception:
+            continue
+    return None, "모든 RSS 피드에서 뉴스를 가져오지 못했습니다."
+
+
+@st.cache_data(ttl=86400, show_spinner=False)  # 하루 캐시
+def fetch_korea_news_gemini(day_key, api_key):
+    """국내 경제 뉴스를 Gemini + 구글검색으로 요약."""
+    if not api_key:
+        return None, "API Key 없음"
+    try:
+        genai.configure(api_key=api_key)
+        prompt = (
+            "오늘 기준 대한민국 경제 관련 주요 뉴스 5개를 구글 검색으로 확인해서 정리해줘.\n"
+            "각 뉴스는 다음 형식으로:\n"
+            "- **[한 줄 제목]**: 무슨 일인지 1~2문장으로 쉽게 설명 (전문용어는 괄호로 풀어서)\n"
+            "증시·금리·환율·부동산·주요 기업 이슈 위주로 골라줘. "
+            "인사말이나 서론 없이 바로 목록부터 시작해. 편안한 존댓말로."
+        )
+        for model_name in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+            try:
+                try:
+                    model = genai.GenerativeModel(model_name, tools=[{"google_search": {}}])
+                except Exception:
+                    model = genai.GenerativeModel(model_name)
+                resp = model.generate_content(prompt)
+                if resp and resp.text:
+                    return resp.text, None
+            except Exception:
+                continue
+        return None, "Gemini 호출 실패"
+    except Exception as e:
+        return None, str(e)
 
 
 # ============================================================
@@ -440,8 +517,8 @@ if len(hist) > 0:
 
     st.write("")
 
-    tab_chart, tab_tech, tab_analyst, tab_check, tab_ai = st.tabs(
-        ["📈 차트", "📊 기술지표", "🏛️ 애널리스트", "🎯 조건검증", "🧠 AI 리포트"]
+    tab_chart, tab_tech, tab_analyst, tab_check, tab_ai, tab_news = st.tabs(
+        ["📈 차트", "📊 기술지표", "🏛️ 애널리스트", "🎯 조건검증", "🧠 AI 리포트", "📰 오늘의 경제"]
     )
 
     # ---------- 탭1: 차트 ----------
@@ -779,5 +856,63 @@ if len(hist) > 0:
                             st.error("모든 모델 호출에 실패했습니다.")
                     except Exception as e:
                         st.error(f"오류 발생: {e}")
+
+    # ---------- 탭6: 오늘의 경제 (세계=RSS / 국내=Gemini) ----------
+    with tab_news:
+        today_key = datetime.date.today().isoformat()
+        st.caption(f"🗓️ {today_key} 기준 · 하루 한 번 자동 업데이트돼요. (새로 보려면 아래 새로고침 버튼)")
+
+        if st.button("🔄 뉴스 새로고침 (오늘 다시 불러오기)"):
+            fetch_world_news_rss.clear()
+            fetch_korea_news_gemini.clear()
+            st.rerun()
+
+        news_col1, news_col2 = st.columns(2)
+
+        # ----- 세계 경제 (RSS) -----
+        with news_col1:
+            st.subheader("🌍 세계 경제")
+            with st.spinner("세계 경제 뉴스를 불러오는 중..."):
+                world_data, world_err = fetch_world_news_rss(today_key)
+            if world_data and world_data.get("items"):
+                st.caption(f"출처: {world_data['source']}")
+                for it in world_data["items"]:
+                    title = it["title"]
+                    link = it["link"]
+                    if link:
+                        st.markdown(f"- [{title}]({link})")
+                    else:
+                        st.markdown(f"- {title}")
+            else:
+                st.info(
+                    "세계 경제 뉴스를 지금 불러오지 못했어요.\n\n"
+                    "RSS 제공처가 일시적으로 응답하지 않거나 접근이 제한됐을 수 있어요. "
+                    "잠시 후 새로고침해보세요."
+                )
+                if world_err:
+                    st.caption(f"참고: {world_err}")
+
+        # ----- 국내 경제 (Gemini) -----
+        with news_col2:
+            st.subheader("🇰🇷 국내 경제")
+            if not api_key:
+                st.warning("국내 경제 뉴스 요약에는 Gemini API Key가 필요해요. 왼쪽 설정에서 입력해주세요.")
+            else:
+                with st.spinner("국내 경제 뉴스를 요약하는 중..."):
+                    kr_text, kr_err = fetch_korea_news_gemini(today_key, api_key)
+                if kr_text:
+                    st.markdown(kr_text)
+                else:
+                    st.info(
+                        "국내 경제 뉴스를 지금 불러오지 못했어요. 잠시 후 새로고침해보세요."
+                    )
+                    if kr_err:
+                        st.caption(f"참고: {kr_err}")
+
+        st.write("---")
+        st.caption(
+            "ℹ️ 세계 경제는 해외 매체 RSS 헤드라인, 국내 경제는 AI가 구글 검색으로 요약한 내용이에요. "
+            "투자 판단의 참고용이며, 원문 확인을 권해요."
+        )
 else:
     st.error("종목 코드가 유효하지 않거나 데이터를 불러올 수 없습니다. 종목명을 다시 선택하거나 코드를 확인해주세요.")
