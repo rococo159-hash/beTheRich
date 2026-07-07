@@ -112,8 +112,9 @@ else:
     if chosen_name != "(직접 입력)":
         ticker = name_map[chosen_name]
     else:
-        raw = typed.strip()
-        ticker = f"{raw}.KS" if raw else "005930.KS"
+        # 숫자만 추출 + 6자리로 zero-padding (예: "5930" -> "005930")
+        raw_digits = "".join(ch for ch in typed.strip() if ch.isdigit())
+        ticker = f"{raw_digits.zfill(6)}.KS" if raw_digits else "005930.KS"
     currency_symbol, cap_unit, cap_divider, small_cap_threshold = "₩", "조 원", 1_000_000_000_000, 1.5
 
 # ============================================================
@@ -161,6 +162,24 @@ if len(hist) > 0:
 
     company_name = info.get('longName', info.get('shortName', ticker))
 
+    # ---- 종목코드 ↔ 실제 데이터 매칭 검증 (엉뚱한 회사 정보 방지) ----
+    # 국내 주식은 야후가 반환한 정보의 symbol이 요청한 티커와 다르거나,
+    # longName/shortName이 아예 비어있으면 잘못된 데이터일 가능성이 높음
+    mismatch_warning = None
+    if market_choice == "국내 주식 (KR)":
+        returned_symbol = (info.get('symbol') or "").upper()
+        expected_code = ticker.split(".")[0]
+        if returned_symbol and expected_code not in returned_symbol:
+            mismatch_warning = (
+                f"⚠️ 요청한 종목코드({ticker})와 야후 파이낸스가 반환한 정보(symbol: {returned_symbol})가 "
+                f"일치하지 않습니다. 아래 회사명이 원하시는 종목이 맞는지 꼭 확인해주세요."
+            )
+        elif not info.get('longName') and not info.get('shortName'):
+            mismatch_warning = (
+                f"⚠️ {ticker}에 대한 회사명 정보를 야후 파이낸스에서 가져오지 못했습니다. "
+                f"종목코드를 다시 확인해주시거나, 잠시 후 다시 시도해주세요."
+            )
+
     valid_close = hist['Close'].dropna()
     current_price = valid_close.iloc[-1] if not valid_close.empty else info.get('regularMarketPrice', info.get('previousClose', 0.0))
     if pd.isna(current_price) or current_price is None:
@@ -190,13 +209,11 @@ if len(hist) > 0:
     hist['RSI'] = 100 - (100 / (1 + rs))
 
     # ---- 골든/데드 크로스 탐지 ----
-    # 가격 크로스: MA20이 MA60을 상향 돌파(골든) / 하향 돌파(데드)
     diff_price = hist['MA20'] - hist['MA60']
-    cross_up = (diff_price.shift(1) < 0) & (diff_price > 0)      # 골든크로스
-    cross_dn = (diff_price.shift(1) > 0) & (diff_price < 0)      # 데드크로스
+    cross_up = (diff_price.shift(1) < 0) & (diff_price > 0)
+    cross_dn = (diff_price.shift(1) > 0) & (diff_price < 0)
     hist['GoldenCross'] = cross_up
     hist['DeadCross'] = cross_dn
-    # MACD 크로스: MACD가 Signal을 상향/하향 돌파
     diff_macd = hist['MACD'] - hist['Signal']
     hist['MacdGolden'] = (diff_macd.shift(1) < 0) & (diff_macd > 0)
     hist['MacdDead'] = (diff_macd.shift(1) > 0) & (diff_macd < 0)
@@ -245,6 +262,14 @@ if len(hist) > 0:
     # ========================================================
     st.markdown(f"### 🏢 현재 분석 중: **{company_name}**  `({ticker})`")
 
+    if mismatch_warning:
+        st.warning(mismatch_warning)
+        rc1, rc2 = st.columns([1, 4])
+        with rc1:
+            if st.button("🔄 데이터 다시 불러오기 (캐시 지우기)"):
+                st.cache_data.clear()
+                st.rerun()
+
     if current_price == 0.0:
         price_str = "N/A"
     elif market_choice == "국내 주식 (KR)":
@@ -282,7 +307,6 @@ if len(hist) > 0:
             row_heights=[0.50, 0.14, 0.18, 0.18], vertical_spacing=0.03,
         )
 
-        # ----- (1행) 캔들 + 이동평균선 -----
         fig.add_trace(go.Candlestick(
             x=view.index, open=view['Open'], high=view['High'],
             low=view['Low'], close=view['Close'], name="가격",
@@ -296,7 +320,6 @@ if len(hist) > 0:
         fig.add_trace(go.Scatter(x=view.index, y=view['MA120'], name="MA120",
                                  line=dict(color="#e040fb", width=1.5)), row=1, col=1)
 
-        # 골든크로스/데드크로스 마커 (가격 차트 위)
         gc = view[view['GoldenCross'] == True]
         dc = view[view['DeadCross'] == True]
         if not gc.empty:
@@ -310,19 +333,16 @@ if len(hist) > 0:
                 marker=dict(symbol='triangle-down', size=13, color='#ff1744',
                             line=dict(width=1, color='white'))), row=1, col=1)
 
-        # ----- (2행) 거래량 -----
         vol_colors = ["#26a69a" if c >= o else "#ef5350"
                       for c, o in zip(view['Close'], view['Open'])]
         fig.add_trace(go.Bar(x=view.index, y=view['Volume'], name="거래량",
                              marker_color=vol_colors, opacity=0.6), row=2, col=1)
 
-        # ----- (3행) RSI -----
         fig.add_trace(go.Scatter(x=view.index, y=view['RSI'], name="RSI",
                                  line=dict(color="#ab47bc", width=1.5)), row=3, col=1)
         fig.add_hline(y=70, line=dict(color="#ef5350", width=1, dash="dash"), row=3, col=1)
         fig.add_hline(y=30, line=dict(color="#26a69a", width=1, dash="dash"), row=3, col=1)
 
-        # ----- (4행) MACD -----
         macd_hist_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in view['Histogram']]
         fig.add_trace(go.Bar(x=view.index, y=view['Histogram'], name="MACD Hist",
                              marker_color=macd_hist_colors, opacity=0.5), row=4, col=1)
@@ -331,7 +351,6 @@ if len(hist) > 0:
         fig.add_trace(go.Scatter(x=view.index, y=view['Signal'], name="Signal",
                                  line=dict(color="#f0b90b", width=1.3)), row=4, col=1)
 
-        # MACD 골든/데드 마커
         mg = view[view['MacdGolden'] == True]
         md = view[view['MacdDead'] == True]
         if not mg.empty:
@@ -376,7 +395,6 @@ if len(hist) > 0:
 
     # ---------- 탭2: 기술지표 ----------
     with tab_tech:
-        # 최근 크로스 발생일 안내
         recent_gc = hist[hist['GoldenCross'] == True].index
         recent_dc = hist[hist['DeadCross'] == True].index
         last_gc = recent_gc[-1].strftime("%Y-%m-%d") if len(recent_gc) else None
@@ -473,9 +491,22 @@ if len(hist) > 0:
                         genai.configure(api_key=api_key)
                         model_candidates = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"]
                         response = None
+                        used_search = False
+
                         prompt = f"""
-너는 글로벌 대형 자산운용사의 수석 투자전략가야. 개인의 전 재산이 걸린 무거운 결정이므로, 맹목적 낙관도 비관도 배제하고 철저히 균형 잡힌 시각으로 분석해.
-반드시 구글 검색을 활용해 '{company_name}'의 최신 사업 현황과 시장 평가를 확인해.
+너는 투자업계에서 20년 넘게 일한 삼촌이야. 지금 조카한테 카톡으로 "이 회사 어때?"라는 질문을 받아서
+편하게, 하지만 아는 건 정확하게 짚어주면서 설명해주는 상황이야.
+
+[말투 규칙 — 반드시 지킬 것]
+- 인사말, 자기소개, "~분석해 드리겠습니다" 같은 서론 문장은 절대 쓰지 말고 바로 0번 항목부터 시작해.
+- 애널리스트 격식체 대신, 삼촌이 조카에게 설명하듯 편안한 존댓말("~예요", "~거든요", "~해요")을 써.
+- 전문용어(PER, ROE, RSI, MACD 등)가 나오면 괄호로 짧게 풀어줘. 예: "PER(주가가 이익 대비 몇 배인지 보는 지표)"
+- 어려운 개념은 일상적인 비유를 들어 설명해. (예: 회사를 가게에 비유, 경쟁을 시험 등수에 비유 등)
+- 전체적으로 지금 흔히 나올 법한 애널리스트 리포트보다 분량을 2/3 수준으로 줄여서, 핵심만 간결하게 써.
+- 감정을 배제하고 균형 잡힌 시각은 유지하되(막연한 낙관·비관 금지), 문체만 편안하게.
+- 특정 매수·매도 시점을 단정적으로 지시하지 마.
+
+반드시 구글 검색을 활용해 '{company_name}'의 최신 사업 현황과 시장 평가를 확인하고 반영해.
 
 [대상]: {company_name} ({ticker})
 [퀀트]: 현재가 {current_price:.2f} / 시총 {market_cap:.2f}{cap_unit} / PER {per_display} / ROE {roe:.2f}%
@@ -484,17 +515,20 @@ if len(hist) > 0:
 [단서]:
 {news_context}
 
-[출력 — 존댓말, 감정 배제, 균형 잡힌 애널리스트 톤]:
-1. 📈 **상승 모멘텀 (Bull Case)**: 핵심 성장 동력과 강세 논리
-2. 🚨 **하방 리스크 (Bear Case)**: 치명적 리스크와 재무·경쟁 약점
-3. 🏛️ **기관 컨센서스 평가**: 목표가·의견의 신뢰도 평가
-4. 📊 **기술적 위치 종합 해설**: 이격도·스토캐스틱·MACD·RSI를 종합해 현재가 과열/침체/중립 중 어디인지 객관적으로 서술. 특정 매수·매도 시점을 단정적으로 지시하지 말고, 시나리오별 관점과 유의점을 균형 있게 제시.
+[출력 순서 — 위 말투 규칙을 지켜서]:
+0. 🏢 **이 회사, 한마디로 뭐하는 곳이야?**: 무슨 사업을 하는 회사인지 쉽게 2~3문장으로 설명하고, 이어서 지금 어떻게 돈을 벌고 있는지(또는 아직 적자라면 앞으로 어떻게 벌 계획인지)를 설명해.
+1. 📈 **오를 만한 이유 (Bull Case)**: 핵심 성장 동력과 강세 논리
+2. 🚨 **내릴 만한 이유 (Bear Case)**: 리스크와 약점
+3. 🏛️ **전문가들 생각 (기관 컨센서스)**: 목표가·의견이 얼마나 믿을만한지
+4. 📊 **지금 차트는 어떤 상태야?**: 이격도·스토캐스틱·MACD·RSI를 종합해서 지금이 과열/침체/중립 중 어디인지, 시나리오별로 균형 있게
+5. ✅ **한 줄 정리**: 위 내용을 3~4줄로 최종 요약. 조카가 결론만 읽어도 감이 잡히게.
 """
                         for model_name in model_candidates:
                             try:
                                 model = genai.GenerativeModel(model_name, tools=[{"google_search": {}}])
                                 response = model.generate_content(prompt)
                                 if response:
+                                    used_search = True
                                     st.caption(f"ℹ️ `{model_name}` (구글 서치 포함) 구동 성공")
                                     break
                             except Exception:
@@ -502,12 +536,15 @@ if len(hist) > 0:
                                     model = genai.GenerativeModel(model_name)
                                     response = model.generate_content(prompt)
                                     if response:
-                                        st.caption(f"ℹ️ `{model_name}` (일반 모드) 구동 성공")
+                                        used_search = False
+                                        st.caption(f"ℹ️ `{model_name}` (일반 모드, 구글 서치 미사용) 구동 성공")
                                         break
                                 except Exception:
                                     continue
                         if response:
                             st.success("✅ 리서치 보고서 발급 완료")
+                            if not used_search:
+                                st.caption("⚠️ 이번 응답은 구글 검색 없이 생성되었습니다. 최신 이슈는 위 뉴스/촉매 입력란을 참고해주세요.")
                             st.markdown(response.text)
                         else:
                             st.error("모든 모델 호출에 실패했습니다.")
